@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # BMI & Health Tracker
 
 A production-ready, full-stack three-tier web application for tracking Body Mass Index (BMI), Basal Metabolic Rate (BMR), and daily calorie requirements with trend visualization. Built with modern web technologies and deployed on AWS EC2.
@@ -1081,3 +1082,7 @@ Lead DevOps Engineer, WPP Production
 📧 Email: sarowar@hotmail.com  
 🔗 LinkedIn: https://www.linkedin.com/in/sarowar/
 ---
+=======
+# single-server-3tier-webapp
+Single Server Three-Tier Web Application
+>>>>>>> 584d6dec11816daf544e6db9913d8caf139c1845
