@@ -1,4 +1,8 @@
-- name: Trigger Deploy Script on AWS Private Server via SSH
+steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Trigger Deploy Script on AWS Private Server via SSH
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.PRIVATE_SERVER_IP }}
@@ -7,15 +11,8 @@
           envs: DB_URL,FRONTEND_URL
           script: |
             cd ~/projects/single-server-3tier-webapp
-            
-            # উইন্ডোজ বা অন্য কোনো সিস্টেম থেকে ফাইল আসার কারণে লাইন এন্ডিংজনিত সমস্যা এড়াতে এটি কনভার্ট করে নেওয়া
             sed -i -e 's/\r$//' deploy.sh
-            
-            # এক্সিকিউটেবল পারমিশন নিশ্চিত করা
             chmod +x deploy.sh
-            
             export DB_URL="${{ secrets.DATABASE_URL }}"
             export FRONTEND_URL="${{ secrets.PUBLIC_DOMAIN_OR_IP }}"
-            
-            # স্ক্রিপ্ট রান করা
             ./deploy.sh
