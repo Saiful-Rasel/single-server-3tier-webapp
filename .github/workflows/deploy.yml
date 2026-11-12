@@ -20,7 +20,9 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           envs: DB_URL,FRONTEND_URL
           script: |
-            cd ~/projects/single-server-3tier-webapp
+            # সঠিক নেস্টেড ফোল্ডারে প্রবেশ করা
+            cd ~/projects/single-server-3tier-webapp/single-server-3tier-webapp
+            
             export DB_URL="${{ secrets.DATABASE_URL }}"
             export FRONTEND_URL="${{ secrets.PUBLIC_DOMAIN_OR_IP }}"
             ./deploy.sh
