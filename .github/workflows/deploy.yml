@@ -16,32 +16,20 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '18'
-          cache: 'npm'
+          # cache বন্ধ রাখা হয়েছে যাতে লক ফাইল না থাকার কারণে কোনো এরর না দেয়
 
-      # --- 1. INSTALL NGINX & SETUP WEB ROOT ---
-      - name: Install and Configure Nginx
-        run: |
-          if ! dpkg -l | grep -q nginx; then
-            echo "Nginx not found. Installing Nginx..."
-            sudo apt update -y
-            sudo apt install -y nginx
-          else
-            echo "Nginx is already installed."
-          fi
-          
-          # Nginx সার্ভিস স্টার্ট ও এনাবল করা
-          sudo systemctl start nginx
-          sudo systemctl enable nginx
-
-          # ফন্টএন্ডের জন্য ওয়েব রুট ফোল্ডার তৈরি ও পারমিশন দেওয়া
-          sudo mkdir -p /var/www/bmi-frontend
-          sudo chown -R $USER:$USER /var/www/bmi-frontend
-
-      # --- 2. BACKEND DEPLOYMENT ---
+      # --- 1. DEPENDENCY INSTALLATION & BUILD (CI PHASE) ---
       - name: Install Backend Dependencies
         working-directory: ./backend
         run: npm install
 
+      - name: Install Frontend Dependencies & Build
+        working-directory: ./frontend
+        run: |
+          npm install
+          npm run build
+
+      # --- 2. BACKEND SETUP & PM2 DEPLOYMENT ---
       - name: Configure Backend Environment (.env)
         working-directory: ./backend
         run: |
@@ -53,21 +41,26 @@ jobs:
       - name: Manage Backend with PM2
         working-directory: ./backend
         run: |
-          # PM2 গ্লোবালি ইন্সটল না থাকলে করে নেওয়া
           sudo npm install -g pm2 || true
-          
-          # PM2 দিয়ে ব্যাকএন্ড প্রসেস স্টার্ট বা রিস্টার্ট করা
           pm2 describe bmi-backend > /dev/null && pm2 restart bmi-backend || pm2 start src/server.js --name "bmi-backend"
           pm2 save
 
-      # --- 3. FRONTEND DEPLOYMENT ---
-      - name: Install Frontend Dependencies
-        working-directory: ./frontend
-        run: npm install
+      # --- 3. NGINX INSTALLATION & FRONTEND DEPLOYMENT (CD PHASE) ---
+      - name: Install and Configure Nginx
+        run: |
+          if ! dpkg -l | grep -q nginx; then
+            echo "Nginx not found. Installing Nginx..."
+            sudo apt update -y
+            sudo apt install -y nginx
+          else
+            echo "Nginx is already installed."
+          fi
+          
+          sudo systemctl start nginx
+          sudo systemctl enable nginx
 
-      - name: Build Frontend Production Assets
-        working-directory: ./frontend
-        run: npm run build
+          sudo mkdir -p /var/www/bmi-frontend
+          sudo chown -R $USER:$USER /var/www/bmi-frontend
 
       - name: Deploy Frontend Files to Nginx Directory
         run: |
@@ -75,10 +68,9 @@ jobs:
           sudo cp -r frontend/dist/* /var/www/bmi-frontend/
           sudo chown -R www-data:www-data /var/www/bmi-frontend
 
-      # --- 4. NGINX REVERSE PROXY CONFIGURATION ---
+      # --- 4. NGINX REVERSE PROXY SETUP ---
       - name: Setup Nginx Server Block
         run: |
-          # ডিফল্ট Nginx কনফিগারেশন ফাইলে রিভার্স প্রক্সি সেটআপ (যদি অলরেডি করা না থাকে)
           sudo bash -c 'cat > /etc/nginx/sites-available/default << '\''EOF'\''
           server {
               listen 80;
@@ -91,7 +83,6 @@ jobs:
                   try_files $uri $uri/ /index.html;
               }
 
-              # Backend API Proxy (যদি ফ্রন্টএন্ড থেকে /api দিয়ে কল করা হয়)
               location /api/ {
                   proxy_pass http://localhost:3000/;
                   proxy_http_version 1.1;
@@ -102,9 +93,9 @@ jobs:
               }
           }
           '\'
-          
+
       - name: Test Nginx Configuration and Reload
         run: |
           sudo nginx -t
           sudo systemctl reload nginx
-          echo "Deployment and Nginx configuration completed successfully!"
+          echo "CI/CD Pipeline and Deployment completed successfully!"
