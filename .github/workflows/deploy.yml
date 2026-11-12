@@ -1,101 +1,54 @@
-name: 3-Tier Web App CI/CD Pipeline
+name: 3-Tier Web App CI/CD to Private Server
 
 on:
   push:
     branches: [ "main" ]
 
 jobs:
-  build-and-deploy:
+  deploy-to-private-server:
     runs-on: self-hosted
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      # --- SSH দিয়ে প্রাইভেট সার্ভারে ফাইল ট্রান্সফার ও ডেপ্লয়মেন্ট ---
+      - name: Copy Files and Deploy to AWS Private Server via SSH
+        uses: appleboy/ssh-action@master
         with:
-          node-version: '18'
-          # cache বন্ধ রাখা হয়েছে যাতে লক ফাইল না থাকার কারণে কোনো এরর না দেয়
+          host: ${{ secrets.PRIVATE_SERVER_IP }}
+          username: ${{ secrets.PRIVATE_SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            echo "--- 1. Pulling or Updating Repository on Private Server ---"
+            cd ~/projects/single-server-3tier-webapp
+            git pull origin main
 
-      # --- 1. DEPENDENCY INSTALLATION & BUILD (CI PHASE) ---
-      - name: Install Backend Dependencies
-        working-directory: ./backend
-        run: npm install
+            echo "--- 2. Installing Backend Dependencies ---"
+            cd backend
+            npm install
 
-      - name: Install Frontend Dependencies & Build
-        working-directory: ./frontend
-        run: |
-          npm install
-          npm run build
+            echo "--- 3. Configuring Backend Environment (.env) ---"
+            echo "PORT=3000" > .env
+            echo "NODE_ENV=production" >> .env
+            echo "DATABASE_URL=${{ secrets.DATABASE_URL }}" >> .env
+            echo "FRONTEND_URL=${{ secrets.PUBLIC_DOMAIN_OR_IP }}" >> .env
 
-      # --- 2. BACKEND SETUP & PM2 DEPLOYMENT ---
-      - name: Configure Backend Environment (.env)
-        working-directory: ./backend
-        run: |
-          echo "PORT=3000" > .env
-          echo "NODE_ENV=production" > .env
-          echo "DATABASE_URL=${{ secrets.DATABASE_URL }}" >> .env
-          echo "FRONTEND_URL=${{ secrets.PUBLIC_DOMAIN_OR_IP }}" >> .env
+            echo "--- 4. Managing Backend with PM2 ---"
+            pm2 describe bmi-backend > /dev/null && pm2 restart bmi-backend || pm2 start src/server.js --name "bmi-backend"
+            pm2 save
 
-      - name: Manage Backend with PM2
-        working-directory: ./backend
-        run: |
-          sudo npm install -g pm2 || true
-          pm2 describe bmi-backend > /dev/null && pm2 restart bmi-backend || pm2 start src/server.js --name "bmi-backend"
-          pm2 save
+            echo "--- 5. Building Frontend Assets ---"
+            cd ../frontend
+            npm install
+            npm run build
 
-      # --- 3. NGINX INSTALLATION & FRONTEND DEPLOYMENT (CD PHASE) ---
-      - name: Install and Configure Nginx
-        run: |
-          if ! dpkg -l | grep -q nginx; then
-            echo "Nginx not found. Installing Nginx..."
-            sudo apt update -y
-            sudo apt install -y nginx
-          else
-            echo "Nginx is already installed."
-          fi
-          
-          sudo systemctl start nginx
-          sudo systemctl enable nginx
+            echo "--- 6. Deploying Frontend to Nginx Directory ---"
+            sudo mkdir -p /var/www/bmi-frontend
+            sudo rm -rf /var/www/bmi-frontend/*
+            sudo cp -r dist/* /var/www/bmi-frontend/
+            sudo chown -R www-data:www-data /var/www/bmi-frontend
 
-          sudo mkdir -p /var/www/bmi-frontend
-          sudo chown -R $USER:$USER /var/www/bmi-frontend
-
-      - name: Deploy Frontend Files to Nginx Directory
-        run: |
-          sudo rm -rf /var/www/bmi-frontend/*
-          sudo cp -r frontend/dist/* /var/www/bmi-frontend/
-          sudo chown -R www-data:www-data /var/www/bmi-frontend
-
-      # --- 4. NGINX REVERSE PROXY SETUP ---
-      - name: Setup Nginx Server Block
-        run: |
-          sudo bash -c 'cat > /etc/nginx/sites-available/default << '\''EOF'\''
-          server {
-              listen 80;
-              server_name _;
-
-              root /var/www/bmi-frontend;
-              index index.html index.htm;
-
-              location / {
-                  try_files $uri $uri/ /index.html;
-              }
-
-              location /api/ {
-                  proxy_pass http://localhost:3000/;
-                  proxy_http_version 1.1;
-                  proxy_set_header Upgrade $http_upgrade;
-                  proxy_set_header Connection '\''upgrade'\'';
-                  proxy_set_header Host $host;
-                  proxy_cache_bypass $http_upgrade;
-              }
-          }
-          '\'
-
-      - name: Test Nginx Configuration and Reload
-        run: |
-          sudo nginx -t
-          sudo systemctl reload nginx
-          echo "CI/CD Pipeline and Deployment completed successfully!"
+            echo "--- 7. Reloading Nginx ---"
+            sudo systemctl reload nginx
+            echo "Deployment to Private Server completed successfully!"
