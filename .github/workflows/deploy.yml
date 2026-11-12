@@ -26,3 +26,5 @@ jobs:
             export DB_URL="${{ secrets.DATABASE_URL }}"
             export FRONTEND_URL="${{ secrets.PUBLIC_DOMAIN_OR_IP }}"
             ./deploy.sh
+
+            
