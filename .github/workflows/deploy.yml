@@ -1,0 +1,615 @@
+# ============================================================
+#  deploy.yml — Self-hosted runner setup + push-to-deploy with auto-rollback
+#
+#  Trigger  : push to main branch
+#  Jobs     :
+#    1. setup-runner  — runs on GitHub-hosted ubuntu-latest
+#                       SSHes into EC2, installs/starts the self-hosted runner
+#                       (idempotent — safe to run on every push)
+#    2. deploy        — runs on the self-hosted runner on EC2
+#                       Full inline deployment: packages → DB → backend →
+#                       frontend → nginx → UFW → certbot
+#                       Re-deploy: skips infra, preserves .env, PM2 reload
+#                       Auto-rollback: reverts to previous commit on failure
+#
+#  Required secrets (repo → Settings → Secrets → Actions):
+#    EC2_HOST        Public IP or hostname of the EC2 instance
+#    EC2_SSH_KEY     Contents of the .pem private key file
+#    DEPLOY_DOMAIN   e.g. bmi.ostaddevops.click
+#    DEPLOY_EMAIL    e.g. admin@bmi.ostaddevops.click
+#
+#  Automatic token (no PAT needed):
+#    GITHUB_TOKEN is granted actions:write permission below so it can
+#    generate runner registration tokens via the GitHub REST API.
+# ============================================================
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+
+# GITHUB_TOKEN cannot generate runner registration tokens (requires
+# administration:write which is not grantable to the built-in token).
+# A PAT with Administration scope is used for that one API call instead.
+# See: repo → Settings → Secrets → GH_PAT
+permissions:
+  contents: read
+
+# Never cancel a running deploy — queue the next one instead.
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # JOB 1: setup-runner
+  # Runs on a GitHub-hosted runner. SSHes into the EC2 instance and ensures
+  # the self-hosted runner is installed, configured, and active.
+  # ══════════════════════════════════════════════════════════════════════════
+  setup-runner:
+    name: Setup self-hosted runner on EC2
+    runs-on: ubuntu-latest
+
+    # Opt into Node.js 24 to silence the Node.js 20 deprecation warning
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+
+      - name: Checkout (needed for .github/scripts/setup-runner.sh)
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets are set
+        run: |
+          MISSING=""
+          [[ -z "${{ secrets.EC2_HOST }}"    ]] && MISSING="${MISSING} EC2_HOST"
+          [[ -z "${{ secrets.EC2_SSH_KEY }}" ]] && MISSING="${MISSING} EC2_SSH_KEY"
+          if [[ -n "$MISSING" ]]; then
+            echo "::error::Missing required secrets:${MISSING}"
+            echo "Add them at: repo → Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+          echo "All required secrets are present"
+
+      - name: Configure SSH access to EC2
+        run: |
+          mkdir -p ~/.ssh
+          # Write key — handle both raw PEM and base64-encoded variants
+          KEY="${{ secrets.EC2_SSH_KEY }}"
+          if echo "$KEY" | grep -q "BEGIN"; then
+            echo "$KEY" > ~/.ssh/ec2_key.pem
+          else
+            echo "$KEY" | base64 -d > ~/.ssh/ec2_key.pem
+          fi
+          chmod 600 ~/.ssh/ec2_key.pem
+          # Verify key is a valid PEM
+          ssh-keygen -l -f ~/.ssh/ec2_key.pem >/dev/null 2>&1 || {
+            echo "::error::EC2_SSH_KEY does not appear to be a valid PEM private key"
+            echo "Open your .pem file and copy the full contents including the header/footer lines"
+            exit 1
+          }
+          echo "SSH key loaded and validated"
+          # Add EC2 host to known_hosts so SSH does not prompt
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Test SSH connectivity to EC2
+        run: |
+          echo "Testing SSH connection to ${{ secrets.EC2_HOST }}..."
+          ssh -i ~/.ssh/ec2_key.pem \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=15 \
+            ubuntu@${{ secrets.EC2_HOST }} \
+            "echo 'SSH OK — connected as $(whoami) on $(hostname)'" \
+          || {
+            echo "::error::Cannot SSH into EC2 at ${{ secrets.EC2_HOST }}"
+            echo "Check: 1) EC2 security group allows port 22 from 0.0.0.0/0"
+            echo "       2) EC2_HOST is the correct public IP or hostname"
+            echo "       3) EC2_SSH_KEY matches the key pair used when launching the instance"
+            exit 1
+          }
+
+      - name: Get runner registration token from GitHub API
+        id: reg-token
+        run: |
+          # GITHUB_TOKEN cannot call this endpoint — administration:write is
+          # required, which is only available on PATs, not the built-in token.
+          # GH_PAT must be a classic PAT or fine-grained PAT with:
+          #   Classic PAT     : "Administration" scope
+          #   Fine-grained PAT: "Self-hosted runners" → Read and write
+          RESPONSE=$(curl -sf -X POST \
+            -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runners/registration-token" \
+            2>&1) || {
+            echo "::error::GitHub API call failed — could not get runner registration token"
+            echo "Response: $RESPONSE"
+            exit 1
+          }
+          TOKEN=$(echo "$RESPONSE" | jq -r '.token // empty')
+          [[ -z "$TOKEN" ]] && {
+            echo "::error::Registration token is empty"
+            echo "GH_PAT must have Administration scope (classic PAT)"
+            echo "or 'Self-hosted runners: Read and write' (fine-grained PAT)"
+            echo "API response: $RESPONSE"
+            exit 1
+          }
+          echo "::add-mask::${TOKEN}"
+          echo "token=${TOKEN}" >> "$GITHUB_OUTPUT"
+          echo "Runner registration token obtained"
+
+      - name: Install and start runner on EC2 (idempotent)
+        run: |
+          ssh -i ~/.ssh/ec2_key.pem \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=15 \
+            ubuntu@${{ secrets.EC2_HOST }} \
+            "REPO='${{ github.repository }}' REG_TOKEN='${{ steps.reg-token.outputs.token }}' bash -s" \
+            < .github/scripts/setup-runner.sh
+
+      - name: Clean up SSH key
+        if: always()
+        run: rm -f ~/.ssh/ec2_key.pem
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # JOB 2: deploy
+  # Runs on the self-hosted runner that setup-runner just ensured is active.
+  # ══════════════════════════════════════════════════════════════════════════
+  deploy:
+    name: Deploy
+    needs: setup-runner
+    runs-on: [self-hosted, linux, x64]
+
+    env:
+      DOMAIN:    ${{ secrets.DEPLOY_DOMAIN }}
+      EMAIL:     ${{ secrets.DEPLOY_EMAIL }}
+      SERVE_DIR: /var/www/html/bmi-health-tracker
+      DB_NAME:   healthtracker
+      DB_USER:   ht_user
+
+    steps:
+
+      # ── 1. Record the live commit SHA before checkout moves HEAD ──────────
+      # This is the rollback target if the new deploy fails.
+      - name: Record pre-deploy commit
+        id: pre
+        run: |
+          SHA=$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD 2>/dev/null || echo "")
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          [[ -n "$SHA" ]] && echo "Pre-deploy SHA: ${SHA}" \
+                          || echo "First deploy — no rollback target yet"
+
+      # ── 2. Checkout new commit ────────────────────────────────────────────
+      # clean: false preserves gitignored backend/.env so the re-deploy
+      # detection (checking for that file) works correctly.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      # ── 3. Detect deploy mode + resolve DB credentials ────────────────────
+      # Re-deploy     → backend/.env exists → read DB password from it
+      # Fresh install → no .env yet         → generate a random DB password
+      - name: Detect mode and resolve credentials
+        id: mode
+        run: |
+          BACKEND_ENV="$GITHUB_WORKSPACE/backend/.env"
+          if [[ -f "$BACKEND_ENV" ]]; then
+            REDEPLOY=true
+            DB_PASS=$(grep '^DATABASE_URL=' "$BACKEND_ENV" \
+              | sed 's|.*://[^:]*:\([^@]*\)@.*|\1|')
+            [[ -z "$DB_PASS" ]] && {
+              echo "ERROR: cannot parse DB_PASS from $BACKEND_ENV"; exit 1
+            }
+            echo "Mode: RE-DEPLOY (existing install detected)"
+          else
+            REDEPLOY=false
+            DB_PASS="$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 28)"
+            echo "Mode: FRESH INSTALL"
+          fi
+          echo "redeploy=${REDEPLOY}" >> "$GITHUB_OUTPUT"
+          # Mask DB password so it never appears in logs
+          echo "::add-mask::${DB_PASS}"
+          echo "DB_PASS=${DB_PASS}" >> "$GITHUB_ENV"
+
+      # ── 4. Detect public IP ───────────────────────────────────────────────
+      - name: Detect public IP
+        run: |
+          PUBLIC_IP=$(curl -sf --max-time 5 \
+            http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null \
+            || curl -sf --max-time 5 https://api.ipify.org 2>/dev/null \
+            || hostname -I | awk '{print $1}')
+          echo "PUBLIC_IP=${PUBLIC_IP}" >> "$GITHUB_ENV"
+          echo "Public IP: ${PUBLIC_IP}"
+
+      # ══════════════════════════════════════════════════════════════════════
+      # STEP 1/8 — System packages (fresh install only)
+      # ══════════════════════════════════════════════════════════════════════
+      - name: 1/8 Install system packages
+        if: steps.mode.outputs.redeploy == 'false'
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -qq
+          sudo apt-get upgrade -y -qq
+          sudo apt-get install -y -qq \
+            curl wget git unzip gnupg lsb-release \
+            ca-certificates software-properties-common \
+            build-essential openssl dnsutils ufw
+          echo "System packages ready"
+
+      # ══════════════════════════════════════════════════════════════════════
+      # STEP 2/8 — Node.js 20 LTS + PM2 (fresh install only)
+      # ══════════════════════════════════════════════════════════════════════
+      - name: 2/8 Install Node.js 20 and PM2
+        if: steps.mode.outputs.redeploy == 'false'
+        run: |
+          if ! command -v node &>/dev/null || \
+             [[ "$(node -v | cut -d. -f1 | tr -d 'v')" -lt 18 ]]; then
+            curl -fsSL https://deb.nodesource.com/setup_20.x \
+              | sudo -E bash - >/dev/null 2>&1
+            sudo apt-get install -y -qq nodejs
+          fi
+          sudo npm install -g pm2 --silent 2>/dev/null || sudo npm install -g pm2
+          echo "Node $(node -v) | npm $(npm -v) | PM2 $(pm2 -v)"
+
+      # ══════════════════════════════════════════════════════════════════════
+      # STEP 3/8 — PostgreSQL
+      # ══════════════════════════════════════════════════════════════════════
+      - name: 3/8 Install and provision PostgreSQL
+        if: steps.mode.outputs.redeploy == 'false'
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          if ! command -v psql &>/dev/null; then
+            sudo apt-get install -y -qq postgresql postgresql-contrib
+          fi
+          sudo systemctl enable postgresql --quiet
+          sudo systemctl start postgresql
+          echo "PostgreSQL $(psql --version | awk '{print $3}') running"
+
+          sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL
+          DO \$\$
+          BEGIN
+            IF NOT EXISTS (
+              SELECT FROM pg_catalog.pg_roles WHERE rolname = '${DB_USER}'
+            ) THEN
+              CREATE ROLE ${DB_USER} LOGIN PASSWORD '${DB_PASS}';
+            ELSE
+              ALTER ROLE ${DB_USER} WITH PASSWORD '${DB_PASS}';
+            END IF;
+          END\$\$;
+
+          SELECT 'CREATE DATABASE ${DB_NAME} OWNER ${DB_USER}'
+            WHERE NOT EXISTS (
+              SELECT FROM pg_database WHERE datname = '${DB_NAME}'
+            )\gexec
+
+          GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};
+          SQL
+
+          # PostgreSQL 15+ requires explicit schema grant
+          sudo -u postgres psql -d "${DB_NAME}" \
+            -c "GRANT ALL ON SCHEMA public TO ${DB_USER};" \
+            >/dev/null 2>&1 || true
+          echo "Database '${DB_NAME}' + user '${DB_USER}' ready"
+
+      - name: 3/8 Ensure PostgreSQL running (re-deploy)
+        if: steps.mode.outputs.redeploy == 'true'
+        run: sudo systemctl start postgresql >/dev/null 2>&1 || true
+
+      - name: 3/8 Run database migrations
+        run: |
+          MIGRATIONS_DIR="$GITHUB_WORKSPACE/backend/migrations"
+          while IFS= read -r MIGRATION; do
+            MNAME="$(basename "$MIGRATION")"
+            if PGPASSWORD="${DB_PASS}" psql \
+                 -h 127.0.0.1 -U "${DB_USER}" -d "${DB_NAME}" \
+                 -f "$MIGRATION" -q 2>&1; then
+              echo "  ✓ $MNAME"
+            else
+              echo "  ↷ $MNAME — may already be applied, continuing"
+            fi
+          done < <(find "$MIGRATIONS_DIR" -maxdepth 1 -name '*.sql' | sort)
+
+      # ══════════════════════════════════════════════════════════════════════
+      # STEP 4/8 — Backend (Node.js / Express + PM2)
+      # ══════════════════════════════════════════════════════════════════════
+      - name: 4/8 Build and start backend
+        run: |
+          BACKEND_DIR="$GITHUB_WORKSPACE/backend"
+          DB_URL="postgresql://${DB_USER}:${DB_PASS}@localhost:5432/${DB_NAME}"
+          FRONTEND_ORIGIN="https://${DOMAIN}"
+
+          cd "$BACKEND_DIR"
+          npm install --omit=dev --silent
+          echo "Backend packages installed"
+
+          # Write .env on fresh install only — preserve on re-deploy
+          if [[ "${{ steps.mode.outputs.redeploy }}" == "false" ]]; then
+            printf 'PORT=3000\nDATABASE_URL=%s\nNODE_ENV=production\nFRONTEND_URL=%s\n' \
+              "${DB_URL}" "${FRONTEND_ORIGIN}" > "$BACKEND_DIR/.env"
+            chmod 600 "$BACKEND_DIR/.env"
+            echo ".env written"
+          else
+            echo ".env preserved (re-deploy)"
+          fi
+
+          mkdir -p "$BACKEND_DIR/logs"
+
+          # Write ecosystem.config.js with absolute paths
+          cat > "$BACKEND_DIR/ecosystem.config.js" <<ECOSYSTEM
+          module.exports = {
+            apps: [{
+              name: 'ht-backend',
+              script: './src/server.js',
+              cwd: '${BACKEND_DIR}',
+              instances: 1,
+              autorestart: true,
+              watch: false,
+              max_memory_restart: '500M',
+              env_file: '${BACKEND_DIR}/.env',
+              env: {
+                NODE_ENV: 'production',
+                PORT: 3000
+              },
+              error_file: '${BACKEND_DIR}/logs/err.log',
+              out_file:   '${BACKEND_DIR}/logs/out.log',
+              log_file:   '${BACKEND_DIR}/logs/combined.log',
+              time: true,
+              merge_logs: true,
+              log_date_format: 'YYYY-MM-DD HH:mm:ss Z'
+            }]
+          };
+          ECOSYSTEM
+          echo "ecosystem.config.js updated"
+
+          # Register PM2 systemd startup (idempotent)
+          sudo env PATH="$PATH:/usr/bin" \
+            pm2 startup systemd -u ubuntu --hp /home/ubuntu >/dev/null 2>&1 || true
+
+          # Zero-downtime reload on re-deploy; clean start on fresh install
+          if [[ "${{ steps.mode.outputs.redeploy }}" == "true" ]]; then
+            pm2 reload "$BACKEND_DIR/ecosystem.config.js" --update-env 2>/dev/null \
+              || pm2 start "$BACKEND_DIR/ecosystem.config.js"
+          else
+            pm2 delete ht-backend 2>/dev/null || true
+            pm2 start "$BACKEND_DIR/ecosystem.config.js"
+          fi
+          pm2 save --force
+
+          sudo systemctl enable pm2-ubuntu >/dev/null 2>&1 || true
+          sudo systemctl start  pm2-ubuntu >/dev/null 2>&1 || true
+
+          # Wait up to 45s for backend
+          echo "Waiting for backend on :3000..."
+          for i in {1..15}; do
+            curl -sf http://127.0.0.1:3000/health >/dev/null 2>&1 && break
+            [[ $i -eq 15 ]] && {
+              pm2 logs ht-backend --lines 30 --nostream || true
+              echo "ERROR: backend did not start within 45s"; exit 1
+            }
+            sleep 3
+          done
+          echo "Backend is up on :3000"
+
+      # ══════════════════════════════════════════════════════════════════════
+      # STEP 5/8 — Frontend (React / Vite build)
+      # ══════════════════════════════════════════════════════════════════════
+      - name: 5/8 Build frontend
+        run: |
+          FRONTEND_DIR="$GITHUB_WORKSPACE/frontend"
+          cd "$FRONTEND_DIR"
+          npm install --silent
+          npm run build
+          [[ -d "$FRONTEND_DIR/dist" ]] || {
+            echo "ERROR: Vite build failed — dist/ not found"; exit 1
+          }
+          echo "Frontend built → $FRONTEND_DIR/dist"
+
+      - name: 5/8 Deploy frontend to web root
+        run: |
+          FRONTEND_DIST="$GITHUB_WORKSPACE/frontend/dist"
+          # Serve from /var/www — www-data owns this tree by default;
+          # no chmod hacks needed for home-directory permission issues.
+          sudo mkdir -p "${SERVE_DIR}"
+          sudo rm -rf "${SERVE_DIR:?}/"*
+          sudo cp -a "$FRONTEND_DIST/." "${SERVE_DIR}/"
+          sudo chown -R www-data:www-data "${SERVE_DIR}"
+          sudo chmod -R 755 "${SERVE_DIR}"
+          echo "Frontend deployed → ${SERVE_DIR}"
+
+      # ══════════════════════════════════════════════════════════════════════
+      # STEP 6/8 — Nginx
+      # Fresh install → full config write, enable site, restart
+      # Re-deploy     → nginx -t + reload-or-restart
+      # ══════════════════════════════════════════════════════════════════════
+      - name: 6/8 Configure Nginx
+        run: |
+          NGINX_CONF="/etc/nginx/sites-available/healthtracker"
+
+          if [[ "${{ steps.mode.outputs.redeploy }}" == "false" ]]; then
+            export DEBIAN_FRONTEND=noninteractive
+            sudo apt-get install -y -qq nginx
+            sudo systemctl enable nginx --quiet
+
+            # _ catches all IPs; replaced with real domain when DOMAIN is set
+            SERVER_NAME="_"
+            [[ -n "${DOMAIN}" ]] && SERVER_NAME="${DOMAIN} www.${DOMAIN}"
+
+            # Copy the nginx config template from the repo; sed fills in the
+            # placeholder values. $host/$uri/$scheme etc. stay literal because
+            # the template file is not processed by bash — only sed touches it.
+            sudo cp "$GITHUB_WORKSPACE/.github/nginx-healthtracker.conf" "$NGINX_CONF"
+
+            sudo sed -i "s|SERVER_NAME_PLACEHOLDER|${SERVER_NAME}|g" "$NGINX_CONF"
+            sudo sed -i "s|SERVE_DIR_PLACEHOLDER|${SERVE_DIR}|g"     "$NGINX_CONF"
+            sudo ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/healthtracker
+            sudo rm -f /etc/nginx/sites-enabled/default
+            sudo nginx -t
+            sudo systemctl restart nginx
+            echo "Nginx configured and running"
+          else
+            sudo nginx -t
+            sudo systemctl reload-or-restart nginx
+            echo "Nginx reloaded"
+          fi
+
+      # ══════════════════════════════════════════════════════════════════════
+      # STEP 7/8 — UFW firewall (fresh install only)
+      # ══════════════════════════════════════════════════════════════════════
+      - name: 7/8 Configure UFW firewall
+        if: steps.mode.outputs.redeploy == 'false'
+        run: |
+          sudo ufw allow OpenSSH      >/dev/null 2>&1
+          sudo ufw allow 'Nginx Full' >/dev/null 2>&1
+          sudo ufw --force enable     >/dev/null 2>&1
+          echo "UFW: SSH + HTTP + HTTPS allowed"
+
+      # ══════════════════════════════════════════════════════════════════════
+      # STEP 8/8 — SSL via Let's Encrypt (Certbot)
+      # Skips if a valid cert already exists (> 24 h until expiry)
+      # ══════════════════════════════════════════════════════════════════════
+      - name: 8/8 Setup SSL with Certbot
+        if: env.DOMAIN != ''
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get install -y -qq certbot python3-certbot-nginx
+
+          CERT_FILE="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+          if [[ -f "$CERT_FILE" ]] && \
+             openssl x509 -checkend 86400 -noout -in "$CERT_FILE" 2>/dev/null; then
+            EXPIRY=$(openssl x509 -noout -enddate -in "$CERT_FILE" \
+                     2>/dev/null | cut -d= -f2)
+            echo "Valid certificate already exists (expires: ${EXPIRY}) — skipping certbot"
+          else
+            RESOLVED_IP=$(host -t A "${DOMAIN}" 2>/dev/null \
+              | grep "has address" | head -1 | awk '{print $NF}' || echo "")
+            if [[ -n "$RESOLVED_IP" && "$RESOLVED_IP" != "${PUBLIC_IP}" ]]; then
+              echo "WARNING: ${DOMAIN} resolves to ${RESOLVED_IP}, expected ${PUBLIC_IP}"
+            elif [[ -n "$RESOLVED_IP" ]]; then
+              echo "DNS OK — ${DOMAIN} → ${RESOLVED_IP}"
+            else
+              echo "WARNING: cannot resolve ${DOMAIN} — DNS may not have propagated"
+            fi
+
+            sudo certbot --nginx \
+              -d "${DOMAIN}" \
+              --email "${EMAIL}" \
+              --agree-tos \
+              --non-interactive \
+              --redirect
+            echo "SSL certificate issued for ${DOMAIN}"
+          fi
+
+          sudo systemctl enable certbot.timer >/dev/null 2>&1 || true
+          sudo systemctl start  certbot.timer >/dev/null 2>&1 || true
+          echo "certbot.timer enabled — auto-renewal active"
+
+      # ── Smoke test ────────────────────────────────────────────────────────
+      # --resolve bypasses AWS hairpin NAT: EC2 cannot curl its own public IP
+      - name: Smoke test
+        run: |
+          sleep 2
+          if [[ -n "${DOMAIN}" ]]; then
+            HEALTH_URL="https://${DOMAIN}/health"
+            HTTP_STATUS=$(curl -sk \
+              --resolve "${DOMAIN}:443:127.0.0.1" \
+              --max-time 15 \
+              -o /dev/null -w "%{http_code}" \
+              "$HEALTH_URL" 2>/dev/null || true)
+          else
+            HEALTH_URL="http://127.0.0.1/health"
+            HTTP_STATUS=$(curl -sk --max-time 15 \
+              -o /dev/null -w "%{http_code}" \
+              "$HEALTH_URL" 2>/dev/null || true)
+          fi
+          echo "Health check (${HEALTH_URL}): HTTP ${HTTP_STATUS}"
+          if [[ "$HTTP_STATUS" != "200" ]]; then
+            echo "::error::Health check failed — HTTP ${HTTP_STATUS}"
+            exit 1
+          fi
+
+      # ── Auto-rollback ─────────────────────────────────────────────────────
+      # Fires only when a previous step failed AND we have a rollback target.
+      # Infrastructure (packages, DB, nginx config, certbot) is already set up
+      # so only app code + assets need to be restored.
+      - name: Auto-rollback to previous commit
+        if: failure() && steps.pre.outputs.sha != ''
+        run: |
+          PRE_SHA="${{ steps.pre.outputs.sha }}"
+          echo "::warning::Deploy failed — rolling back to ${PRE_SHA}"
+          git checkout "${PRE_SHA}"
+
+          BACKEND_DIR="$GITHUB_WORKSPACE/backend"
+          FRONTEND_DIR="$GITHUB_WORKSPACE/frontend"
+
+          # Restore backend
+          cd "$BACKEND_DIR"
+          npm install --omit=dev --silent
+          cat > "$BACKEND_DIR/ecosystem.config.js" <<ECOSYSTEM
+          module.exports = {
+            apps: [{
+              name: 'ht-backend',
+              script: './src/server.js',
+              cwd: '${BACKEND_DIR}',
+              instances: 1,
+              autorestart: true,
+              watch: false,
+              max_memory_restart: '500M',
+              env_file: '${BACKEND_DIR}/.env',
+              env: { NODE_ENV: 'production', PORT: 3000 },
+              error_file: '${BACKEND_DIR}/logs/err.log',
+              out_file:   '${BACKEND_DIR}/logs/out.log',
+              log_file:   '${BACKEND_DIR}/logs/combined.log',
+              time: true,
+              merge_logs: true,
+              log_date_format: 'YYYY-MM-DD HH:mm:ss Z'
+            }]
+          };
+          ECOSYSTEM
+          pm2 reload "$BACKEND_DIR/ecosystem.config.js" --update-env 2>/dev/null \
+            || pm2 start "$BACKEND_DIR/ecosystem.config.js"
+          pm2 save --force
+
+          for i in {1..15}; do
+            curl -sf http://127.0.0.1:3000/health >/dev/null 2>&1 && break
+            [[ $i -eq 15 ]] && { echo "ERROR: rolled-back backend failed to start"; exit 1; }
+            sleep 3
+          done
+
+          # Restore frontend
+          cd "$FRONTEND_DIR"
+          npm install --silent
+          npm run build
+          sudo rm -rf "${SERVE_DIR:?}/"*
+          sudo cp -a "$FRONTEND_DIR/dist/." "${SERVE_DIR}/"
+          sudo chown -R www-data:www-data "${SERVE_DIR}"
+          sudo chmod -R 755 "${SERVE_DIR}"
+          sudo nginx -t && sudo systemctl reload-or-restart nginx
+
+          sleep 2
+          RB_STATUS=$(curl -sk \
+            --resolve "${DOMAIN}:443:127.0.0.1" \
+            --max-time 15 \
+            -o /dev/null -w "%{http_code}" \
+            "https://${DOMAIN}/health" 2>/dev/null || true)
+          echo "Rollback health check: HTTP ${RB_STATUS}"
+          if [[ "$RB_STATUS" == "200" ]]; then
+            echo "::notice::Rollback to ${PRE_SHA} succeeded — site is healthy"
+          else
+            echo "::error::Rollback health check failed (HTTP ${RB_STATUS}) — manual intervention required"
+            exit 1
+          fi
+
+      # ── Deployment summary ────────────────────────────────────────────────
+      - name: Deployment summary
+        if: success()
+        run: |
+          COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          {
+            echo "### Deploy successful"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`${COMMIT}\` |"
+            [[ -n "${DOMAIN}" ]] && echo "| URL | https://${DOMAIN} |"
+            echo "| Health | https://${DOMAIN}/health |"
+          } >> "$GITHUB_STEP_SUMM
