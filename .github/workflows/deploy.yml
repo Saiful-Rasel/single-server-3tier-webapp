@@ -12,45 +12,15 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # --- SSH দিয়ে প্রাইভেট সার্ভারে ফাইল ট্রান্সফার ও ডেপ্লয়মেন্ট ---
-      - name: Copy Files and Deploy to AWS Private Server via SSH
+      - name: Trigger Deploy Script on AWS Private Server via SSH
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.PRIVATE_SERVER_IP }}
           username: ${{ secrets.PRIVATE_SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: DB_URL,FRONTEND_URL
           script: |
-            set -e  # কোনো কমান্ডে এরর আসলে স্ক্রিপ্ট থেমে যাবে
-            
-            echo "--- 1. Pulling or Updating Repository on Private Server ---"
             cd ~/projects/single-server-3tier-webapp
-            git pull origin main
-
-            echo "--- 2. Installing Backend Dependencies ---"
-            cd backend
-            npm install
-
-            echo "--- 3. Configuring Backend Environment (.env) ---"
-            echo "PORT=3000" > .env
-            echo "NODE_ENV=production" >> .env
-            echo "DATABASE_URL=${{ secrets.DATABASE_URL }}" >> .env
-            echo "FRONTEND_URL=${{ secrets.PUBLIC_DOMAIN_OR_IP }}" >> .env
-
-            echo "--- 4. Managing Backend with PM2 ---"
-            pm2 describe bmi-backend > /dev/null && pm2 restart bmi-backend || pm2 start src/server.js --name "bmi-backend"
-            pm2 save
-
-            echo "--- 5. Building Frontend Assets ---"
-            cd ../frontend
-            npm install
-            npm run build
-
-            echo "--- 6. Deploying Frontend to Nginx Directory ---"
-            sudo mkdir -p /var/www/bmi-frontend
-            sudo rm -rf /var/www/bmi-frontend/*
-            sudo cp -r dist/* /var/www/bmi-frontend/
-            sudo chown -R www-data:www-data /var/www/bmi-frontend
-
-            echo "--- 7. Reloading Nginx ---"
-            sudo systemctl reload nginx
-            echo "Deployment to Private Server completed successfully!"
+            export DB_URL="${{ secrets.DATABASE_URL }}"
+            export FRONTEND_URL="${{ secrets.PUBLIC_DOMAIN_OR_IP }}"
+            ./deploy.sh
