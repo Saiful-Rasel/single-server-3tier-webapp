@@ -20,6 +20,8 @@ jobs:
           username: ${{ secrets.PRIVATE_SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
+            set -e  # কোনো কমান্ডে এরর আসলে স্ক্রিপ্ট থেমে যাবে
+            
             echo "--- 1. Pulling or Updating Repository on Private Server ---"
             cd ~/projects/single-server-3tier-webapp
             git pull origin main
