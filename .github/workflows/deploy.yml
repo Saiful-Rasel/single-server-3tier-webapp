@@ -1,4 +1,3 @@
-```yaml
 name: Deploy 3-Tier App via AWS SSM
 
 on:
@@ -15,7 +14,6 @@ permissions:
   contents: read
 
 jobs:
-
   # ==========================================================
   # CI: Build frontend and upload artifact to private S3
   # ==========================================================
@@ -29,7 +27,6 @@ jobs:
       id-token: write
 
     steps:
-
       - name: Checkout source
         uses: actions/checkout@v4
 
@@ -78,7 +75,6 @@ jobs:
 
           echo "Frontend artifact uploaded: $ARTIFACT_URI"
 
-
   # ==========================================================
   # CD: Trigger deployment on private EC2 using AWS SSM
   # ==========================================================
@@ -95,7 +91,6 @@ jobs:
       id-token: write
 
     steps:
-
       # Obtain temporary AWS credentials using GitHub OIDC.
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -186,4 +181,3 @@ jobs:
 
           echo "Deployment polling timed out."
           exit 1
-```
