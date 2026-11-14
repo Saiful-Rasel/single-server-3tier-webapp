@@ -1,3 +1,4 @@
+
 name: Deploy 3-Tier App via AWS SSM
 
 on:
@@ -51,7 +52,47 @@ jobs:
           test -f frontend/dist/index.html
           echo "Frontend build verified."
 
+      # ========================================================
+      # DEBUG: Inspect actual GitHub OIDC token claims.
+      # Never print or expose the complete JWT token.
+      # ========================================================
+
+      - name: Debug GitHub OIDC Claims
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Request a short-lived OIDC token from GitHub.
+          TOKEN_RESPONSE=$(curl -fsS \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
+
+          TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.value')
+
+          # Decode only the JWT payload.
+          PAYLOAD=$(echo "$TOKEN" | cut -d '.' -f 2)
+
+          # Convert Base64 URL-safe characters to standard Base64.
+          PAYLOAD=$(printf '%s' "$PAYLOAD" | tr '_-' '/+')
+
+          # Restore required Base64 padding.
+          PADDING=$(( (4 - ${#PAYLOAD} % 4) % 4 ))
+          PAYLOAD="${PAYLOAD}$(printf '%*s' "$PADDING" '' | tr ' ' '=')"
+
+          # Display only the claims needed for debugging.
+          echo "$PAYLOAD" | base64 -d | jq '{
+            iss,
+            aud,
+            sub,
+            repository,
+            ref,
+            workflow_ref
+          }'
+
+      # ========================================================
       # GitHub OIDC -> AWS IAM Role
+      # ========================================================
+
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
