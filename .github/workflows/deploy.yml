@@ -1,28 +1,189 @@
-name: Deploy 3-Tier App to AWS Private Server
+```yaml
+name: Deploy 3-Tier App via AWS SSM
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
+
+# Prevent overlapping production deployments.
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
-  deploy:
+
+  # ==========================================================
+  # CI: Build frontend and upload artifact to private S3
+  # ==========================================================
+
+  build:
+    name: Build Frontend
     runs-on: self-hosted
-    
+
+    permissions:
+      contents: read
+      id-token: write
+
     steps:
-      - name: Checkout code
+
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Trigger Deploy Script on AWS Private Server via SSH
-        uses: appleboy/ssh-action@master
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          host: ${{ secrets.PRIVATE_SERVER_IP }}
-          username: ${{ secrets.PRIVATE_SERVER_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: DB_URL,FRONTEND_URL
-          script: |
-            cd ~/projects/single-server-3tier-webapp
-            sed -i -e 's/\r$//' deploy.sh
-            chmod +x deploy.sh
-            export DB_URL="${{ secrets.DATABASE_URL }}"
-            export FRONTEND_URL="${{ secrets.PUBLIC_DOMAIN_OR_IP }}"
-            ./deploy.sh
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Verify frontend build
+        run: |
+          set -euo pipefail
+          test -f frontend/dist/index.html
+          echo "Frontend build verified."
+
+      # GitHub OIDC -> AWS IAM Role
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Upload this commit's artifact to its own S3 prefix.
+      - name: Upload frontend artifact to S3
+        env:
+          DEPLOY_BUCKET: ${{ vars.DEPLOY_BUCKET }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          ARTIFACT_URI="s3://${DEPLOY_BUCKET}/frontend/${COMMIT_SHA}/"
+
+          aws s3 sync \
+            frontend/dist/ \
+            "$ARTIFACT_URI" \
+            --only-show-errors
+
+          echo "Frontend artifact uploaded: $ARTIFACT_URI"
+
+
+  # ==========================================================
+  # CD: Trigger deployment on private EC2 using AWS SSM
+  # ==========================================================
+
+  deploy:
+    name: Deploy to Private EC2
+    runs-on: self-hosted
+
+    needs:
+      - build
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+
+      # Obtain temporary AWS credentials using GitHub OIDC.
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Trigger deployment and wait for SSM result.
+      - name: Deploy through AWS SSM
+        env:
+          INSTANCE_ID: ${{ vars.SSM_INSTANCE_ID }}
+          DEPLOY_BUCKET: ${{ vars.DEPLOY_BUCKET }}
+          COMMIT_SHA: ${{ github.sha }}
+
+        run: |
+          set -euo pipefail
+
+          APP_DIR="/home/ubuntu/projects/single-server-3tier-webapp"
+
+          ARTIFACT_URI="s3://${DEPLOY_BUCKET}/frontend/${COMMIT_SHA}/"
+
+          echo "Starting SSM deployment..."
+          echo "Instance: $INSTANCE_ID"
+          echo "Artifact: $ARTIFACT_URI"
+
+          # Build the SSM command safely using jq.
+          # SSM runs as root; the deployment script runs as ubuntu.
+          COMMANDS=$(jq -nc \
+            --arg uri "$ARTIFACT_URI" \
+            --arg app_dir "$APP_DIR" \
+            '{
+              commands: [
+                "set -euo pipefail",
+                (
+                  "sudo -u ubuntu -H env ARTIFACT_S3_URI="
+                  + ($uri | @sh)
+                  + " bash -lc "
+                  + (("cd " + ($app_dir | @sh) + " && ./deploy.sh") | @sh)
+                )
+              ]
+            }')
+
+          # Send deployment command to the private EC2 instance.
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "$COMMANDS" \
+            --comment "Application deployment: $COMMIT_SHA" \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+
+          # Poll deployment status for up to 5 minutes.
+          for i in $(seq 1 60); do
+
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query 'Status' \
+              --output text 2>/dev/null || echo "Pending")
+
+            echo "Deployment status: $STATUS"
+
+            case "$STATUS" in
+
+              Success)
+                echo "Deployment completed successfully!"
+                exit 0
+                ;;
+
+              Failed|Cancelled|TimedOut|DeliveryTimedOut|ExecutionTimedOut|Undeliverable|Terminated)
+
+                echo "Deployment failed!"
+
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --output json || true
+
+                exit 1
+                ;;
+
+            esac
+
+            sleep 5
+          done
+
+          echo "Deployment polling timed out."
+          exit 1
+```
