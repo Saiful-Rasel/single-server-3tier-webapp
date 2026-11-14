@@ -278,7 +278,7 @@ Type=simple
 User=ubuntu
 Group=ubuntu
 
-WorkingDirectory=${APP_ROOT}/current/backend
+WorkingDirectory=${APP_ROOT}/current
 
 EnvironmentFile=${SHARED_DIR}/.env
 Environment=NODE_ENV=production
