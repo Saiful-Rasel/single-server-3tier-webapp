@@ -15,21 +15,31 @@ permissions:
   contents: read
 
 jobs:
+
   # ==========================================================
-  # CI: Build frontend and upload artifact to private S3
+  # CI: Build frontend + package backend + upload to S3
   # ==========================================================
 
   build:
-    name: Build Frontend
-    runs-on: self-hosted
+    name: Build and Upload Artifacts
+    runs-on: ubuntu-latest
 
     permissions:
       contents: read
       id-token: write
 
     steps:
+
+      # --------------------------------------------------------
+      # 1. Checkout source
+      # --------------------------------------------------------
+
       - name: Checkout source
         uses: actions/checkout@v4
+
+      # --------------------------------------------------------
+      # 2. Setup Node.js
+      # --------------------------------------------------------
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -37,6 +47,10 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+
+      # --------------------------------------------------------
+      # 3. Build frontend
+      # --------------------------------------------------------
 
       - name: Install frontend dependencies
         working-directory: frontend
@@ -49,49 +63,49 @@ jobs:
       - name: Verify frontend build
         run: |
           set -euo pipefail
+
           test -f frontend/dist/index.html
+
           echo "Frontend build verified."
 
-      # ========================================================
-      # DEBUG: Inspect actual GitHub OIDC token claims.
-      # Never print or expose the complete JWT token.
-      # ========================================================
+      # --------------------------------------------------------
+      # 4. Package backend with production dependencies
+      # --------------------------------------------------------
 
-      - name: Debug GitHub OIDC Claims
+      - name: Package backend
         shell: bash
         run: |
           set -euo pipefail
 
-          # Request a short-lived OIDC token from GitHub.
-          TOKEN_RESPONSE=$(curl -fsS \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
+          mkdir -p backend-package/backend
 
-          TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.value')
+          # Copy backend source without secrets or local dependencies.
+          rsync -a \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            --exclude='node_modules' \
+            --exclude='logs' \
+            backend/ backend-package/backend/
 
-          # Decode only the JWT payload.
-          PAYLOAD=$(echo "$TOKEN" | cut -d '.' -f 2)
+          # Install production dependencies in the package directory.
+          cd backend-package/backend
 
-          # Convert Base64 URL-safe characters to standard Base64.
-          PAYLOAD=$(printf '%s' "$PAYLOAD" | tr '_-' '/+')
+          npm ci --omit=dev
 
-          # Restore required Base64 padding.
-          PADDING=$(( (4 - ${#PAYLOAD} % 4) % 4 ))
-          PAYLOAD="${PAYLOAD}$(printf '%*s' "$PADDING" '' | tr ' ' '=')"
+          cd ../..
 
-          # Display only the claims needed for debugging.
-          echo "$PAYLOAD" | base64 -d | jq '{
-            iss,
-            aud,
-            sub,
-            repository,
-            ref,
-            workflow_ref
-          }'
+          # Build archive with backend/ as its root directory.
+          tar -czf backend.tar.gz \
+            -C backend-package \
+            backend
 
-      # ========================================================
-      # GitHub OIDC -> AWS IAM Role
-      # ========================================================
+          test -s backend.tar.gz
+
+          echo "Backend archive created successfully."
+
+      # --------------------------------------------------------
+      # 5. Configure AWS using GitHub OIDC
+      # --------------------------------------------------------
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -99,11 +113,16 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      # Upload this commit's artifact to its own S3 prefix.
+      # --------------------------------------------------------
+      # 6. Upload frontend artifact
+      # --------------------------------------------------------
+
       - name: Upload frontend artifact to S3
         env:
           DEPLOY_BUCKET: ${{ vars.DEPLOY_BUCKET }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
           COMMIT_SHA: ${{ github.sha }}
+
         run: |
           set -euo pipefail
 
@@ -112,17 +131,62 @@ jobs:
           aws s3 sync \
             frontend/dist/ \
             "$ARTIFACT_URI" \
+            --region "$AWS_REGION" \
             --only-show-errors
 
-          echo "Frontend artifact uploaded: $ARTIFACT_URI"
+          echo "Frontend uploaded: $ARTIFACT_URI"
+
+      # --------------------------------------------------------
+      # 7. Upload backend archive
+      # --------------------------------------------------------
+
+      - name: Upload backend archive to S3
+        env:
+          DEPLOY_BUCKET: ${{ vars.DEPLOY_BUCKET }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          COMMIT_SHA: ${{ github.sha }}
+
+        run: |
+          set -euo pipefail
+
+          aws s3 cp \
+            backend.tar.gz \
+            "s3://${DEPLOY_BUCKET}/backend/${COMMIT_SHA}/backend.tar.gz" \
+            --region "$AWS_REGION" \
+            --only-show-errors
+
+          echo "Backend archive uploaded."
+
+      # --------------------------------------------------------
+      # 8. Upload deployment script
+      # --------------------------------------------------------
+
+      - name: Upload deploy.sh to S3
+        env:
+          DEPLOY_BUCKET: ${{ vars.DEPLOY_BUCKET }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          COMMIT_SHA: ${{ github.sha }}
+
+        run: |
+          set -euo pipefail
+
+          test -f deploy.sh
+
+          aws s3 cp \
+            deploy.sh \
+            "s3://${DEPLOY_BUCKET}/backend/${COMMIT_SHA}/deploy.sh" \
+            --region "$AWS_REGION" \
+            --only-show-errors
+
+          echo "Deployment script uploaded."
 
   # ==========================================================
-  # CD: Trigger deployment on private EC2 using AWS SSM
+  # CD: Deploy artifacts to private EC2 using AWS SSM
   # ==========================================================
 
   deploy:
     name: Deploy to Private EC2
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
 
     needs:
       - build
@@ -132,49 +196,62 @@ jobs:
       id-token: write
 
     steps:
-      # Obtain temporary AWS credentials using GitHub OIDC.
+
+      # --------------------------------------------------------
+      # 1. Configure AWS credentials
+      # --------------------------------------------------------
+
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      # Trigger deployment and wait for SSM result.
+      # --------------------------------------------------------
+      # 2. Deploy through AWS SSM
+      # --------------------------------------------------------
+
       - name: Deploy through AWS SSM
         env:
           INSTANCE_ID: ${{ vars.SSM_INSTANCE_ID }}
           DEPLOY_BUCKET: ${{ vars.DEPLOY_BUCKET }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
           COMMIT_SHA: ${{ github.sha }}
 
+        shell: bash
         run: |
           set -euo pipefail
 
-          APP_DIR="/home/ubuntu/projects/single-server-3tier-webapp"
-
-          ARTIFACT_URI="s3://${DEPLOY_BUCKET}/frontend/${COMMIT_SHA}/"
-
           echo "Starting SSM deployment..."
           echo "Instance: $INSTANCE_ID"
-          echo "Artifact: $ARTIFACT_URI"
+          echo "Commit: $COMMIT_SHA"
 
-          # Build the SSM command safely using jq.
-          # SSM runs as root; the deployment script runs as ubuntu.
+          DEPLOY_SCRIPT_URI="s3://${DEPLOY_BUCKET}/backend/${COMMIT_SHA}/deploy.sh"
+
+          # Execute the deployment script as root through SSM.
           COMMANDS=$(jq -nc \
-            --arg uri "$ARTIFACT_URI" \
-            --arg app_dir "$APP_DIR" \
+            --arg bucket "$DEPLOY_BUCKET" \
+            --arg sha "$COMMIT_SHA" \
+            --arg region "$AWS_REGION" \
+            --arg script_uri "$DEPLOY_SCRIPT_URI" \
             '{
               commands: [
-                "set -euo pipefail",
                 (
-                  "sudo -u ubuntu -H env ARTIFACT_S3_URI="
-                  + ($uri | @sh)
-                  + " bash -lc "
-                  + (("cd " + ($app_dir | @sh) + " && ./deploy.sh") | @sh)
+                  "set -euo pipefail\n"
+                  + "DEPLOY_SCRIPT=/tmp/bmi-deploy-" + $sha + ".sh\n"
+                  + "aws s3 cp " + ($script_uri | @sh)
+                  + " \"$DEPLOY_SCRIPT\" --region " + ($region | @sh)
+                  + " --only-show-errors\n"
+                  + "chmod 700 \"$DEPLOY_SCRIPT\"\n"
+                  + "export DEPLOY_BUCKET=" + ($bucket | @sh) + "\n"
+                  + "export COMMIT_SHA=" + ($sha | @sh) + "\n"
+                  + "export AWS_REGION=" + ($region | @sh) + "\n"
+                  + "bash \"$DEPLOY_SCRIPT\""
                 )
               ]
             }')
 
-          # Send deployment command to the private EC2 instance.
+          # Send command to private EC2.
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
@@ -185,8 +262,8 @@ jobs:
 
           echo "SSM Command ID: $COMMAND_ID"
 
-          # Poll deployment status for up to 5 minutes.
-          for i in $(seq 1 60); do
+          # Wait for deployment result (maximum 15 minutes).
+          for i in $(seq 1 180); do
 
             STATUS=$(aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \

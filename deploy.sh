@@ -1,4 +1,4 @@
-```bash
+
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -354,4 +354,49 @@ done
 
 if [[ "$HEALTH_CHECK_PASSED" != true ]]; then
     log "Backend health check failed."
-    systemctl status "$BACKEND_SERVICE
+
+    systemctl status "$BACKEND_SERVICE" --no-pager || true
+    journalctl -u "$BACKEND_SERVICE" -n 50 --no-pager || true
+
+    # Trigger rollback instead of reporting a successful deployment.
+    exit 1
+fi
+
+log "Backend health check passed."
+
+# ------------------------------------------------------------
+# 17. Verify frontend
+# ------------------------------------------------------------
+
+log "Checking frontend..."
+
+if ! curl -fsS http://127.0.0.1/ >/dev/null; then
+    log "Frontend health check failed."
+    exit 1
+fi
+
+# ------------------------------------------------------------
+# 18. Cleanup old releases
+# ------------------------------------------------------------
+
+log "Cleaning old releases..."
+
+find "$APP_ROOT/releases" -mindepth 1 -maxdepth 1 -type d \\
+    -printf '%T@ %p\\n' |
+    sort -rn |
+    tail -n +6 |
+    cut -d' ' -f2- |
+    while IFS= read -r release; do
+        [[ -n "$release" ]] && rm -rf -- "$release"
+    done
+
+find "$FRONTEND_ROOT/releases" -mindepth 1 -maxdepth 1 -type d \\
+    -printf '%T@ %p\\n' |
+    sort -rn |
+    tail -n +6 |
+    cut -d' ' -f2- |
+    while IFS= read -r release; do
+        [[ -n "$release" ]] && rm -rf -- "$release"
+    done
+
+log "Deployment completed successfully."
